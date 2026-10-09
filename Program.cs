@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -34,18 +35,30 @@ public static class Program
     static readonly HttpClient Http = new();
     static readonly DateTimeOffset WindowStart = DateTimeOffset.Now.AddDays(-7);
     static readonly DateTimeOffset WindowEnd = DateTimeOffset.Now.AddDays(60);
-    const string StateFile = "flyoutsync-state.json";
+    static string ConfigPath => Path.Join(AppContext.BaseDirectory, "flyoutsync.json");
+    static string StatePath => Path.Join(AppContext.BaseDirectory, "flyoutsync-state.json");
 
-    public static async Task Main()
+    public static async Task Main(string[] args)
     {
+        var command = args.Length > 0 ? args[0].ToLowerInvariant() : "sync";
+        switch (command)
+        {
+            case "setup":     await Setup(); break;
+            case "install":   Install(); break;
+            case "uninstall": await Uninstall(); break;
+            default:          await RunSync(); break;
+        }
+        
         var config = JsonSerializer.Deserialize<Config>(
-            File.ReadAllText("flyoutsync.json"),
+            File.ReadAllText(ConfigPath),
             new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
             ?? throw new InvalidOperationException("Could not read flyoutsync.json. Is it in the same folder as the exe?");
 
-        var state = File.Exists(StateFile)
-            ? JsonSerializer.Deserialize<State>(File.ReadAllText(StateFile)) ?? new State()
+        var state = File.Exists(StatePath)
+            ? JsonSerializer.Deserialize<State>(File.ReadAllText(StatePath)) ?? new State()
             : new State();
+        
+        await File.WriteAllTextAsync(StatePath, JsonSerializer.Serialize(state));
 
         var store = await AppointmentManager.RequestStoreAsync(
             AppointmentStoreAccessType.AppCalendarsReadWrite);
@@ -59,7 +72,7 @@ public static class Program
             }
         }
 
-        await File.WriteAllTextAsync(StateFile, JsonSerializer.Serialize(state));
+        await File.WriteAllTextAsync(StatePath, JsonSerializer.Serialize(state));
     }
 
     static async Task SyncSource(AppointmentStore store, State state, SourceConfig src)
@@ -216,7 +229,132 @@ public static class Program
         }
         return items;
     }
+    
+    static string ReadPassword() {
+        var pw = new System.Text.StringBuilder();
+        while (true) {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Enter) { Console.WriteLine(); return pw.ToString(); }
+            if (key.Key == ConsoleKey.Backspace && pw.Length > 0) pw.Length--;
+            else if (!char.IsControl(key.KeyChar)) pw.Append(key.KeyChar);
+        }
+    }
+    
+    static void Install()
+    {
+        var exe = Environment.ProcessPath!;   // full path of this exe
+        var psi = new ProcessStartInfo("schtasks",
+            $"/create /tn FlyoutSync /tr \"conhost.exe --headless \"{exe}\"\" /sc minute /mo 15 /f")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        var p = Process.Start(psi)!;
+        p.WaitForExit();
+        Console.WriteLine(p.ExitCode == 0
+            ? "Installed. FlyoutSync will refresh every 15 minutes."
+            : "Task registration failed - if your exe path contains spaces, tell me and I'll adjust the quoting.");
+    }
 
+    static async Task Uninstall()
+    {
+        var psi = new ProcessStartInfo("schtasks", "/delete /tn FlyoutSync /f")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        Process.Start(psi)!.WaitForExit();
+
+        var store = await AppointmentManager.RequestStoreAsync(
+            AppointmentStoreAccessType.AppCalendarsReadWrite);
+        foreach (var cal in await store.FindAppointmentCalendarsAsync())
+            if (cal.DisplayName.StartsWith("Flyout - "))
+                await cal.DeleteAsync();
+
+        Console.WriteLine("FlyoutSync removed - scheduled task and calendar entries deleted.");
+    }
+    
+    static async Task Setup()
+        {
+            Console.WriteLine("FlyoutSync setup - mirrors iCloud, Google and Outlook into the taskbar clock.");
+            var sources = new List<SourceConfig>();
+
+            if (Ask("Include iCloud?"))
+            {
+                Console.Write("  Apple ID (e.g. yourname@icloud.com): ");
+                var user = Console.ReadLine() ?? "";
+                Console.Write("  App-specific password (appleid.apple.com > Sign-In and Security): ");
+                sources.Add(new SourceConfig("iCloud", "caldav", "https://caldav.icloud.com/", user, ReadPassword()));
+            }
+
+            if (Ask("Include Google?"))
+            {
+                Console.Write("  Secret iCal address (Google Calendar web > gear > Settings > Integrate calendar): ");
+                sources.Add(new SourceConfig("Google", "ics", Console.ReadLine() ?? ""));
+            }
+
+            if (Ask("Include Outlook?"))
+            {
+                Console.Write("  Published ICS link (Outlook web > Settings > Calendar > Shared calendars): ");
+                sources.Add(new SourceConfig("Outlook", "ics", Console.ReadLine() ?? ""));
+            }
+
+            // Live test sync before we save anything
+            var state = new State();
+            var store = await AppointmentManager.RequestStoreAsync(
+                AppointmentStoreAccessType.AppCalendarsReadWrite);
+
+            var failures = 0;
+            foreach (var src in sources)
+            {
+                try { await SyncSource(store, state, src); }
+                catch (Exception ex) { failures++; Console.Error.WriteLine($"  [{src.Name}] failed: {ex.Message}"); }
+            }
+            await File.WriteAllTextAsync(StatePath, JsonSerializer.Serialize(state));
+
+            if (failures > 0 && !Ask("At least one source failed. Save this configuration anyway?"))
+                return;
+
+            await File.WriteAllTextAsync(ConfigPath,
+                JsonSerializer.Serialize(new Config(sources), new JsonSerializerOptions { WriteIndented = true }));
+            Console.WriteLine("Configuration saved next to the exe.");
+
+            if (Ask("Install the 15-minute auto-refresh now?"))
+                Install();
+    }
+
+    static bool Ask(string question)
+    {
+        Console.Write($"{question} (y/n): ");
+        return (Console.ReadLine() ?? "").Trim().StartsWith("y", StringComparison.OrdinalIgnoreCase);
+    }
+    
+    static async Task RunSync()
+    {
+        var config = JsonSerializer.Deserialize<Config>(
+                         File.ReadAllText(ConfigPath),
+                         new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                     ?? throw new InvalidOperationException("Could not read flyoutsync.json.");
+
+        var state = File.Exists(StatePath)
+            ? JsonSerializer.Deserialize<State>(File.ReadAllText(StatePath)) ?? new State()
+            : new State();
+
+        var store = await AppointmentManager.RequestStoreAsync(
+            AppointmentStoreAccessType.AppCalendarsReadWrite);
+
+        foreach (var src in config.Sources)
+        {
+            try { await SyncSource(store, state, src); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[{src.Name}] sync failed: {ex.Message}");
+            }
+        }
+
+        await File.WriteAllTextAsync(StatePath, JsonSerializer.Serialize(state));
+    }
+    
     static DateTimeOffset ToDateTimeOffset(IDateTime dt, bool hasTime)
     {
         var when = dt.Value;

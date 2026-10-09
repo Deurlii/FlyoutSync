@@ -5,12 +5,13 @@
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- the calendar-parsing library; added automatically by
-         the "dotnet add package Ical.Net" step, so this line may
-         already be present with a version number attached -->
     <PackageReference Include="Ical.Net" Version="4.3.1" />
   </ItemGroup>
 
