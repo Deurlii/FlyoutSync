@@ -141,9 +141,10 @@ public static class Program
     {
         // a) discover current-user-principal
         var principal = await Propfind(s.Url!, s,
-            "<D:prop xmlns:D='DAV:'><D:current-user-principal/></D:prop>",
+            "<propfind xmlns='DAV:'><prop><current-user-principal/></prop></propfind>",
             depth: "0",
-            pick: x => x.Descendants(Dav + "href").FirstOrDefault()?.Value);
+            pick: x => x.Descendants(Dav + "current-user-principal")
+                .Descendants(Dav + "href").FirstOrDefault()?.Value);
         if (string.IsNullOrEmpty(principal))
             throw new InvalidOperationException("CalDAV: no principal found - check username/password");
 
@@ -151,42 +152,31 @@ public static class Program
         var baseUri = new Uri(s.Url!);
         var principalUri = new Uri(baseUri, principal);
         var homeSet = await Propfind(principalUri.ToString(), s,
-            "<D:prop xmlns:D='DAV:' xmlns:C='urn:ietf:params:xml:ns:caldav'>" +
-            "<C:calendar-home-set/></D:prop>",
+            "<propfind xmlns='DAV:' xmlns:C='urn:ietf:params:xml:ns:caldav'>" +
+            "<prop><C:calendar-home-set/></prop></propfind>",
             depth: "0",
-            pick: x => x.Descendants(Cal + "href").FirstOrDefault()?.Value);
+            pick: x => x.Descendants(Cal + "calendar-home-set")
+                .Descendants(Dav + "href").FirstOrDefault()?.Value);
         if (string.IsNullOrEmpty(homeSet))
             throw new InvalidOperationException("CalDAV: no calendar-home-set found");
 
-        // c) REPORT calendar-query: all events overlapping the sync window
         var homeUri = new Uri(principalUri, homeSet).ToString();
-        var fmt = "yyyyMMdd'T'HHmmss'Z'";
-        var body = new XElement(Cal + "calendar-query",
-            new XAttribute(XNamespace.Xmlns + "D", Dav),
-            new XAttribute(XNamespace.Xmlns + "C", Cal),
-            new XElement(Dav + "prop", new XElement(Dav + "getetag"),
-                         new XElement(Cal + "calendar-data")),
-            new XElement(Cal + "filter",
-                new XElement(Cal + "comp-filter", new XAttribute("name", "VCALENDAR"),
-                    new XElement(Cal + "comp-filter", new XAttribute("name", "VEVENT"),
-                        new XElement(Cal + "time-range",
-                            new XAttribute("start", WindowStart.UtcDateTime.ToString(fmt)),
-                            new XAttribute("end", WindowEnd.UtcDateTime.ToString(fmt))))))).ToString();
 
-        using var req = new HttpRequestMessage(new HttpMethod("REPORT"), homeUri);
-        req.Headers.Authorization = BasicAuth(s);
-        req.Headers.Add("Depth", "1");
-        req.Content = new StringContent(body, Encoding.UTF8, "application/xml");
+        // c) list the actual calendar collections inside the home
+        var calendarHrefs = await ListCalendarCollections(homeUri, s);
+        if (calendarHrefs.Count == 0)
+            throw new InvalidOperationException("CalDAV: home set contains no calendar collections");
 
-        using var resp = await Http.SendAsync(req);
-        resp.EnsureSuccessStatusCode();
-        var xml = XDocument.Parse(await resp.Content.ReadAsStringAsync());
-
+        // d) REPORT each calendar individually (Apple rejects queries on the home itself)
         var events = new List<EventItem>();
-        foreach (var data in xml.Descendants(Cal + "calendar-data"))
+        foreach (var href in calendarHrefs)
         {
-            var ics = (string?)data;
-            if (!string.IsNullOrEmpty(ics)) events.AddRange(ParseCalendar(Calendar.Load(ics!)));
+            var calUri = new Uri(new Uri(homeUri), href).ToString();
+            try { events.AddRange(await ReportCalendar(calUri, s)); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"  [iCloud] skipping calendar {href}: {ex.Message}");
+            }
         }
         return events;
     }
@@ -197,9 +187,14 @@ public static class Program
         using var req = new HttpRequestMessage(new HttpMethod("PROPFIND"), url);
         req.Headers.Authorization = BasicAuth(s);
         req.Headers.Add("Depth", depth);
-        req.Content = new StringContent(propBody, Encoding.UTF8, "application/xml");
+        req.Content = new StringContent(propBody, Encoding.UTF8, "text/xml");
         using var resp = await Http.SendAsync(req);
-        resp.EnsureSuccessStatusCode();
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync();
+            throw new InvalidOperationException(
+                $"PROPFIND {url} -> {(int)resp.StatusCode} {resp.ReasonPhrase}: {body}");
+        }
         return pick(XDocument.Parse(await resp.Content.ReadAsStringAsync()));
     }
 
@@ -230,7 +225,8 @@ public static class Program
         return items;
     }
     
-    static string ReadPassword() {
+    static string ReadPassword() 
+    {
         var pw = new System.Text.StringBuilder();
         while (true) {
             var key = Console.ReadKey(intercept: true);
@@ -275,52 +271,52 @@ public static class Program
     }
     
     static async Task Setup()
+    {
+        Console.WriteLine("FlyoutSync setup - mirrors iCloud, Google and Outlook into the taskbar clock.");
+        var sources = new List<SourceConfig>();
+
+        if (Ask("Include iCloud?"))
         {
-            Console.WriteLine("FlyoutSync setup - mirrors iCloud, Google and Outlook into the taskbar clock.");
-            var sources = new List<SourceConfig>();
+            Console.Write("  Apple ID (e.g. yourname@icloud.com): ");
+            var user = Console.ReadLine() ?? "";
+            Console.Write("  App-specific password (appleid.apple.com > Sign-In and Security): ");
+            sources.Add(new SourceConfig("iCloud", "caldav", "https://caldav.icloud.com/", user, ReadPassword()));
+        }
 
-            if (Ask("Include iCloud?"))
-            {
-                Console.Write("  Apple ID (e.g. yourname@icloud.com): ");
-                var user = Console.ReadLine() ?? "";
-                Console.Write("  App-specific password (appleid.apple.com > Sign-In and Security): ");
-                sources.Add(new SourceConfig("iCloud", "caldav", "https://caldav.icloud.com/", user, ReadPassword()));
-            }
+        if (Ask("Include Google?"))
+        {
+            Console.Write("  Secret iCal address (Google Calendar web > gear > Settings > Integrate calendar): ");
+            sources.Add(new SourceConfig("Google", "ics", Console.ReadLine() ?? ""));
+        }
 
-            if (Ask("Include Google?"))
-            {
-                Console.Write("  Secret iCal address (Google Calendar web > gear > Settings > Integrate calendar): ");
-                sources.Add(new SourceConfig("Google", "ics", Console.ReadLine() ?? ""));
-            }
+        if (Ask("Include Outlook?"))
+        {
+            Console.Write("  Published ICS link (Outlook web > Settings > Calendar > Shared calendars): ");
+            sources.Add(new SourceConfig("Outlook", "ics", Console.ReadLine() ?? ""));
+        }
 
-            if (Ask("Include Outlook?"))
-            {
-                Console.Write("  Published ICS link (Outlook web > Settings > Calendar > Shared calendars): ");
-                sources.Add(new SourceConfig("Outlook", "ics", Console.ReadLine() ?? ""));
-            }
+        // Live test sync before we save anything
+        var state = new State();
+        var store = await AppointmentManager.RequestStoreAsync(
+            AppointmentStoreAccessType.AppCalendarsReadWrite);
 
-            // Live test sync before we save anything
-            var state = new State();
-            var store = await AppointmentManager.RequestStoreAsync(
-                AppointmentStoreAccessType.AppCalendarsReadWrite);
+        var failures = 0;
+        foreach (var src in sources)
+        {
+            try { await SyncSource(store, state, src); }
+            catch (Exception ex) { failures++; Console.Error.WriteLine($"  [{src.Name}] failed: {ex.Message}"); }
+        }
+        await File.WriteAllTextAsync(StatePath, JsonSerializer.Serialize(state));
 
-            var failures = 0;
-            foreach (var src in sources)
-            {
-                try { await SyncSource(store, state, src); }
-                catch (Exception ex) { failures++; Console.Error.WriteLine($"  [{src.Name}] failed: {ex.Message}"); }
-            }
-            await File.WriteAllTextAsync(StatePath, JsonSerializer.Serialize(state));
+        if (failures > 0 && !Ask("At least one source failed. Save this configuration anyway?"))
+            return;
 
-            if (failures > 0 && !Ask("At least one source failed. Save this configuration anyway?"))
-                return;
+        await File.WriteAllTextAsync(ConfigPath,
+            JsonSerializer.Serialize(new Config(sources), new JsonSerializerOptions { WriteIndented = true }));
+        Console.WriteLine("Configuration saved next to the exe.");
 
-            await File.WriteAllTextAsync(ConfigPath,
-                JsonSerializer.Serialize(new Config(sources), new JsonSerializerOptions { WriteIndented = true }));
-            Console.WriteLine("Configuration saved next to the exe.");
-
-            if (Ask("Install the 15-minute auto-refresh now?"))
-                Install();
+        if (Ask("Install the 15-minute auto-refresh now?"))
+            Install();
     }
 
     static bool Ask(string question)
@@ -353,6 +349,75 @@ public static class Program
         }
 
         await File.WriteAllTextAsync(StatePath, JsonSerializer.Serialize(state));
+    }
+    
+    static async Task<List<string>> ListCalendarCollections(string homeUri, SourceConfig s)
+    {
+        using var req = new HttpRequestMessage(new HttpMethod("PROPFIND"), homeUri);
+        req.Headers.Authorization = BasicAuth(s);
+        req.Headers.Add("Depth", "1");
+        req.Content = new StringContent(
+            "<propfind xmlns='DAV:' xmlns:C='urn:ietf:params:xml:ns:caldav'>" +
+            "<prop><resourcetype/><displayname/></prop></propfind>",
+            Encoding.UTF8, "text/xml");
+
+        using var resp = await Http.SendAsync(req);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var errorBody = await resp.Content.ReadAsStringAsync();
+            throw new InvalidOperationException(
+                $"PROPFIND {homeUri} -> {(int)resp.StatusCode} {resp.ReasonPhrase}: {errorBody}");
+        }
+
+        var xml = XDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var result = new List<string>();
+        foreach (var r in xml.Descendants(Dav + "response"))
+        {
+            // only actual calendars (resourcetype contains C:calendar);
+            // the home also contains inboxes, notifications, etc.
+            if (!r.Descendants(Cal + "calendar").Any()) continue;
+            var href = r.Element(Dav + "href")?.Value;
+            if (!string.IsNullOrEmpty(href)) result.Add(href);
+        }
+        return result;
+    }
+
+    static async Task<List<EventItem>> ReportCalendar(string calUri, SourceConfig s)
+    {
+        var fmt = "yyyyMMdd'T'HHmmss'Z'";
+        var body = new XElement(Cal + "calendar-query",
+            new XAttribute(XNamespace.Xmlns + "D", Dav),
+            new XAttribute(XNamespace.Xmlns + "C", Cal),
+            new XElement(Dav + "prop", new XElement(Dav + "getetag"),
+                         new XElement(Cal + "calendar-data")),
+            new XElement(Cal + "filter",
+                new XElement(Cal + "comp-filter", new XAttribute("name", "VCALENDAR"),
+                    new XElement(Cal + "comp-filter", new XAttribute("name", "VEVENT"),
+                        new XElement(Cal + "time-range",
+                            new XAttribute("start", WindowStart.UtcDateTime.ToString(fmt)),
+                            new XAttribute("end",   WindowEnd.UtcDateTime.ToString(fmt))))))).ToString();
+
+        using var req = new HttpRequestMessage(new HttpMethod("REPORT"), calUri);
+        req.Headers.Authorization = BasicAuth(s);
+        req.Headers.Add("Depth", "1");
+        req.Content = new StringContent(body, Encoding.UTF8, "text/xml");
+
+        using var resp = await Http.SendAsync(req);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var errorBody = await resp.Content.ReadAsStringAsync();
+            throw new InvalidOperationException(
+                $"REPORT {calUri} -> {(int)resp.StatusCode} {resp.ReasonPhrase}: {errorBody}");
+        }
+
+        var xml = XDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var events = new List<EventItem>();
+        foreach (var data in xml.Descendants(Cal + "calendar-data"))
+        {
+            var ics = (string?)data;
+            if (!string.IsNullOrEmpty(ics)) events.AddRange(ParseCalendar(Calendar.Load(ics!)));
+        }
+        return events;
     }
     
     static DateTimeOffset ToDateTimeOffset(IDateTime dt, bool hasTime)
