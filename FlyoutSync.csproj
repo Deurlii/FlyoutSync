@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- the calendar-parsing library; added automatically by
+         the "dotnet add package Ical.Net" step, so this line may
+         already be present with a version number attached -->
+    <PackageReference Include="Ical.Net" Version="4.3.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="flyoutsync.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

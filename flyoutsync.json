@@ -1,0 +1,21 @@
+{
+  "Sources": [
+    {
+      "Name": "iCloud",
+      "Kind": "caldav",
+      "Url": "https://caldav.icloud.com/",
+      "Username": "[APPLE ID EMAIL HERE]",
+      "Password": "[APPLE APP SPEC PASSWORD HERE]"
+    },
+    {
+      "Name": "Google",
+      "Kind": "ics",
+      "Url": "[GOOGLE CALENDAR SHARE LINK HERE]"
+    },
+    {
+      "Name": "Outlook",
+      "Kind": "ics",
+      "Url": "OUTLOOK CALENDAR SHARE LINK HERE"
+    }
+  ]
+}
